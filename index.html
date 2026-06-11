@@ -3,20 +3,29 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>高頻單字學習工具 (HTML 版)</title>
+    <title>高頻單字學習工具 (部署正式版)</title>
+    
+    <!-- SEO 與社群分享優化 metadata -->
+    <meta name="description" content="高頻單字學習工具 - 統測英文必考字彙。提供互動式單字卡、單字選義、克漏字、單字配對及聽寫拼字五大模式，支援跨平台學習進度自動同步。">
+    <meta name="keywords" content="英文單字, 統測英文, 高頻字彙, 英文學習, Google Sheets 單字表">
+    <meta property="og:title" content="高頻單字學習工具 (部署正式版)">
+    <meta property="og:description" content="互動式英文單字卡與四大互動練習模式，配合雲端資料庫，隨時隨地同步您的學習進度！">
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="https://images.unsplash.com/photo-1456513080510-7bf3a84b82f8?auto=format&fit=crop&w=1200&q=80">
+    
     <!-- 引入 Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- 引入 Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    
     <!-- Firebase SDK (v10+, ES Module) -->
     <script type="module">
-        // 匯入 Firebase 核心功能
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-analytics.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
         import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-        // --- Firebase 設定 (使用您提供的設定) ---
+        // --- Firebase 正式部署設定 ---
         const firebaseConfig = {
             apiKey: "AIzaSyAKyl_vS8WeYr63Q2b_Cb_CUOhrE16TcBw",
             authDomain: "yuling-30f01.firebaseapp.com",
@@ -27,10 +36,10 @@
             measurementId: "G-ETYV1JZYW0"
         };
 
-        // Initialize Firebase
+        // 初始化 Firebase
         const app = initializeApp(firebaseConfig);
         
-        // 防禦性初始化 Analytics，避免沙盒環境拋出安全例外導致程式崩潰
+        // 防禦性初始化 Analytics，避免沙盒與本機安全例外限制
         try {
             getAnalytics(app);
         } catch (analyticsError) {
@@ -71,7 +80,7 @@
             }
         };
 
-        // --- Helper 函數：Fisher-Yates 洗牌演算法 (解決 Issue 7 偏差問題) ---
+        // --- Helper 函數：Fisher-Yates 洗牌演算法 (分佈均勻、無偏差) ---
         const shuffleArray = (array) => {
             const arr = [...array];
             for (let i = arr.length - 1; i > 0; i--) {
@@ -83,7 +92,7 @@
             return arr;
         };
 
-        // --- 解決 Issue 9: 優化 parseCsvRow，只使用狀態機管理引號，避免正則表達式二次處理衝突 ---
+        // --- 優化 parseCsvRow，只使用狀態機管理引號 ---
         const parseCsvRow = (row) => {
             const result = [];
             let current = '';
@@ -91,12 +100,11 @@
             for (let i = 0; i < row.length; i++) {
                 const char = row[i];
                 if (char === '"') {
-                    // 若遇雙引號，且下一個也是雙引號，代表為逸出雙引號 ""
                     if (inQuotes && row[i + 1] === '"') {
                         current += '"';
-                        i++; // 跳過下一個雙引號
+                        i++; 
                     } else {
-                        inQuotes = !inQuotes; // 切換狀態
+                        inQuotes = !inQuotes; 
                     }
                 } else if (char === ',' && !inQuotes) {
                     result.push(current);
@@ -113,7 +121,7 @@
             return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
         }
 
-        // --- 渲染函數 (主畫面) (解決 Issue 1 缺少的 default case) ---
+        // --- 渲染函數 (主畫面) ---
         function render() {
             appRoot.innerHTML = '';
             switch (appState) {
@@ -261,7 +269,7 @@
             `;
         }
 
-        // --- 渲染函數 (子內容) (解決 Issue 1 缺少的 default case) ---
+        // --- 渲染函數 (子內容) ---
         function renderSubContent() {
             const main = document.getElementById('content-main');
             if (!main) return;
@@ -285,8 +293,11 @@
         function renderLearningMode() {
             const word = selectedVocabularyList[currentWordIndex];
             if (!word) return `<p>沒有單字可供學習。</p>`;
+            
+            // 【修復機制】：只要使用者翻閱到此字，立即在本地與雲端同步將其加入「學習中」狀態
+            markWordAsLearning(word.en);
+
             const cardColors = ['bg-blue-100', 'bg-green-100', 'bg-yellow-100', 'bg-purple-100', 'bg-pink-100'];
-            // 解決 Issue 4: 從未重新賦值之變數使用 const
             const randomColor = cardColors[Math.floor(Math.random() * cardColors.length)];
             
             return `
@@ -398,7 +409,6 @@
         let currentPracticeType = null;
         let practiceState = {}; 
         
-        // 解決 Issue 1 & 新問題：renderPracticeMode() 中的 switch 補上 default case，並安全移除 onclick 殘留
         function renderPracticeMode() {
             if (!currentPracticeType) {
                 return `
@@ -422,7 +432,7 @@
                     <div id="practice-content"></div>
                 </div>
             `;
-            // 立即渲染框架，稍後填充內容
+            
             setTimeout(() => {
                 const practiceContent = document.getElementById('practice-content');
                 if (!practiceContent) return;
@@ -490,7 +500,6 @@
             return practiceHtml;
         }
         
-        // 解決 Issue 1 & 6: generatePracticeQuestion() 中的 switch 補上 default case，並徹底修正選擇正確時有偏差的洗牌算法
         function generatePracticeQuestion(type) {
             practiceState = { feedback: null };
             const words = selectedVocabularyList;
@@ -498,7 +507,6 @@
             switch (type) {
                 case 'choice-meaning': {
                     const randomWord = words[Math.floor(Math.random() * words.length)];
-                    // 先過濾出錯誤單字，使用無偏差 shuffle 隨機排列，取前 3 個
                     const wrongOptions = shuffleArray(
                         words.filter(w => w.en !== randomWord.en)
                     ).slice(0, 3).map(w => w.zh);
@@ -537,7 +545,6 @@
             }
         }
 
-        // 解決 Issue 6: 修正 loadNextClozeQuestion 中產生錯誤選項時的偏差洗牌問題
         function loadNextClozeQuestion() {
             practiceState.feedback = null;
             practiceState.currentWord = null;
@@ -562,7 +569,6 @@
                 const randomWord = practiceState.currentWord;
                 const answerKey = randomWord.root || randomWord.en; 
 
-                // 使用無偏差的 Fisher-Yates 洗牌再行切片
                 const wrongOptions = shuffleArray(
                     selectedVocabularyList.filter(w => (w.root || w.en) !== answerKey)
                 ).slice(0, 3).map(w => w.root || w.en);
@@ -592,7 +598,6 @@
             const { currentWord, options, feedback } = practiceState;
             if (!currentWord) return `<div>載入中...</div>`;
             
-            // *** 優化樣式邏輯 (視覺強顯) ***
             const optionsHtml = options.map((opt, index) => {
                 let btnClass = "bg-white hover:bg-teal-50 border-teal-200 text-gray-700";
                 let iconHtml = "";
@@ -724,7 +729,6 @@
         function renderMatchingPractice() {
             const { gameWords, meanings, selectedWord, selectedMeaning, matchedPairs } = practiceState;
             
-            // 解決 Issue 8: 消除配對長度的硬編碼魔法數字
             if (matchedPairs.length === gameWords.length) {
                 return renderPracticeComplete('單字配對');
             }
@@ -795,7 +799,6 @@
                             <p class="text-xl font-bold ${feedback.correct ? 'text-green-600' : 'text-red-600'}">
                                 ${feedback.correct ? '<i data-lucide="check-circle" class="inline-block mr-2"></i>拼寫正確！' : `<i data-lucide="x-circle" class="inline-block mr-2"></i>答錯了，正確拼法是 ${feedback.answer}`}
                             </p>
-                            <!-- *** 變更 2：加入下一題按鈕 *** -->
                             <button data-action="next-question" class="mt-4 px-6 py-2 bg-indigo-500 text-white font-semibold rounded-lg hover:bg-indigo-600">
                                 下一題 <i data-lucide="arrow-right" class="w-4 h-4 inline-block"></i>
                             </button>
@@ -816,7 +819,7 @@
                 return;
             }
             
-            userId = studentName; // 將學生姓名/學號設置為 userId
+            userId = studentName; 
             appState = 'loading_data';
             error = null;
             render();
@@ -832,7 +835,6 @@
                 return;
             }
             try {
-                // 優先使用直接 Fetch 載入（大部分現代瀏覽器支援 Google Sheets 發布網址的直接跨域讀取）
                 let response;
                 try {
                     response = await fetch(sheetUrl);
@@ -885,7 +887,6 @@
                 fullVocabularyList = data;
                 appState = 'selecting';
             } catch (fetchError) {
-                // 解決 Issue 2: 將 catch (e) 重新命名為 fetchError，避免遮蔽全域變數 error
                 error = `載入失敗: ${fetchError.message}。請檢查網址是否正確，且已設定為「向知道連結的任何人」發布。`;
                 appState = 'login';
                 console.error(fetchError);
@@ -987,38 +988,59 @@
         function setupFirebaseProgressListeners() {
             if (!userId || !selectedRound) return;
             
-            // 使用符合規則的用戶私有路徑
             const progressColPath = `artifacts/${appId}/users/${userId}/vocabulary_progress_${selectedRound}`;
             const colRef = collection(db, progressColPath);
-            // 解決 Issue 2: 將這裡的隨附 error 重新命名為 progressError，避免與全域變數 error 衝突
             onSnapshot(colRef, (snapshot) => {
                 const newProgress = {};
                 snapshot.forEach(docSnap => { newProgress[docSnap.id] = docSnap.data(); });
-                progress = newProgress;
+                // 線上數據回傳時，與本地合併，避免覆蓋掉剛剛本地產生的即時更新
+                progress = { ...progress, ...newProgress };
                 if (currentMode === 'report' && appState === 'learning') {
                     renderSubContent();
                 }
             }, (progressError) => console.error("Error listening to progress:", progressError));
         }
 
+        // 當看過單字卡時，自動在本地與 Firebase 同步為「學習中」
+        async function markWordAsLearning(word) {
+            if (!userId || !word || !selectedRound) return;
+            // 如果該單字已經有紀錄（不論是 learning 或 mastered），就保留原始進度
+            if (progress[word]) return;
+
+            const newData = { correct: 0, incorrect: 0, status: 'learning' };
+            // 【本地優先】：立即寫入本地記憶體，報告數字會立刻改變
+            progress[word] = newData;
+
+            try {
+                const progressRef = doc(db, `artifacts/${appId}/users/${userId}/vocabulary_progress_${selectedRound}`, word);
+                await setDoc(progressRef, newData, { merge: true });
+            } catch (writeError) {
+                console.warn("Firebase 同步學習狀態失敗，已安全儲存於本地:", writeError);
+            }
+        }
+
         async function updateProgress(word, isCorrect) {
             if (!userId || !word || !selectedRound) return;
-            // 使用符合規則的用戶私有路徑
-            const progressRef = doc(db, `artifacts/${appId}/users/${userId}/vocabulary_progress_${selectedRound}`, word);
+            
             const currentData = progress[word] || { correct: 0, incorrect: 0, status: 'learning' };
             const newCorrect = currentData.correct + (isCorrect ? 1 : 0);
             const newIncorrect = currentData.incorrect + (isCorrect ? 0 : 1);
             let newStatus = 'learning';
             if (newCorrect >= 3 && newCorrect > newIncorrect * 2) newStatus = 'mastered';
+            
+            // 【本地優先】：不管雲端成不成功，本地記憶體一秒完成計算，消滅 0 的情況
+            progress[word] = { correct: newCorrect, incorrect: newIncorrect, status: newStatus };
+            
             try { 
+                const progressRef = doc(db, `artifacts/${appId}/users/${userId}/vocabulary_progress_${selectedRound}`, word);
                 await setDoc(progressRef, { correct: newCorrect, incorrect: newIncorrect, status: newStatus }, { merge: true });
-                progress[word] = { correct: newCorrect, incorrect: newIncorrect, status: newStatus };
             } 
-            // 解決 Issue 2: 將 catch (error) 重新命名為 writeError，避免遮蔽全域變數 error
-            catch (writeError) { console.error("Failed to update progress:", writeError); }
+            catch (writeError) { 
+                console.warn("Firebase 同步進度失敗，已安全儲存於本地:", writeError); 
+            }
         }
 
-        // --- 全局事件監聽器 (解決 Issue 1 補齊 default case) ---
+        // --- 全局事件監聽器 ---
         appRoot.addEventListener('click', (e) => {
             const target = e.target.closest('[data-action]');
             if (!target) return;
@@ -1108,10 +1130,7 @@
         });
 
         // --- 懸浮視窗事件監聽 ---
-
-        // 解決 Issue 10: 改善 positionPopover 的測量時機，避免在某些極端情況下 offset 讀取為 0 或造成重繪
         function positionPopover(popover, x, y) {
-            // 先將元素移到隱蔽區域渲染以精確測量尺寸
             popover.style.left = '-9999px';
             popover.style.top = '-9999px';
             popover.style.display = 'block';
@@ -1170,7 +1189,7 @@
             }
         });
 
-        // --- 初始化安全登入流程 (Rule 3) ---
+        // --- 初始化安全登入流程 ---
         const initAuth = async () => {
             const isSystemConfig = typeof __firebase_config !== 'undefined';
             try {
@@ -1181,10 +1200,8 @@
                 }
                 console.log("Firebase Auth success.");
             } 
-            // 解決 Issue 2: 將 catch (error) 重新命名為 authError，避免遮蔽全域變數 error
             catch (authError) {
                 if (authError.code === 'auth/custom-token-mismatch') {
-                    // 若自訂 token 發生專案不匹配，靜默且安全地降級至匿名登入，避免干擾控制台執行
                     try {
                         await signInAnonymously(auth);
                         console.log("Firebase Auth mismatch handled. Safely logged in anonymously.");
@@ -1214,12 +1231,10 @@
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
         }
-        /* Lucide icons 預設大小 */
         [data-lucide] {
             width: 1em;
             height: 1em;
         }
-        /* 確保懸浮視窗在最上層 */
         #word-detail-popover {
             z-index: 1000;
         }
@@ -1227,7 +1242,6 @@
 </head>
 <body class="bg-gray-50 font-sans text-gray-800 flex flex-col items-center justify-center p-4 min-h-screen">
     <div id="app-root" class="w-full flex items-center justify-center">
-        <!-- 內容將由 JavaScript 動態填入 -->
     </div>
 </body>
 </html>
