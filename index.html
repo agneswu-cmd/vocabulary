@@ -1,0 +1,1233 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>高頻單字學習工具 (HTML 版)</title>
+    <!-- 引入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDK (v10+, ES Module) -->
+    <script type="module">
+        // 匯入 Firebase 核心功能
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-analytics.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+        // --- Firebase 設定 (使用您提供的設定) ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyAKyl_vS8WeYr63Q2b_Cb_CUOhrE16TcBw",
+            authDomain: "yuling-30f01.firebaseapp.com",
+            projectId: "yuling-30f01",
+            storageBucket: "yuling-30f01.firebasestorage.app",
+            messagingSenderId: "618709551097",
+            appId: "1:618709551097:web:ff431e12a9606e23531f28",
+            measurementId: "G-ETYV1JZYW0"
+        };
+
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        
+        // 防禦性初始化 Analytics，避免沙盒環境拋出安全例外導致程式崩潰
+        try {
+            getAnalytics(app);
+        } catch (analyticsError) {
+            console.warn("Google Analytics blocked or failed to initialize in this environment:", analyticsError);
+        }
+
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        // --- 應用程式 ID ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-vocab-master-gs';
+
+        // --- 全域狀態 ---
+        let appState = 'login'; // 'login', 'loading_data', 'selecting', 'learning'
+        const sheetUrl = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTrZiJbrRvFCqq7Xm1JwaNMogFj3UB7BJBn1fkqBPS7Wf-D2lndDBU-OqKCwNRMmBOnTwZHhqamEOjo/pub?gid=0&single=true&output=csv';
+        let fullVocabularyList = [];
+        let selectedVocabularyList = [];
+        let selectedRound = null;
+        let error = null;
+        let userId = null; // 學生姓名
+        let progress = {};
+        let currentWordIndex = 0;
+        let currentMode = 'learn'; // 'learn', 'practice', 'report'
+
+        // --- DOM 節點 ---
+        const appRoot = document.getElementById('app-root');
+
+        // --- TTS 語音合成 ---
+        const speak = (text, lang = 'en-US') => {
+            if ('speechSynthesis' in window && text) {
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = lang;
+                utterance.rate = 0.9;
+                window.speechSynthesis.speak(utterance);
+            } else {
+                console.error('瀏覽器不支援語音合成功能或文字為空。');
+            }
+        };
+
+        // --- Helper 函數：Fisher-Yates 洗牌演算法 (解決 Issue 7 偏差問題) ---
+        const shuffleArray = (array) => {
+            const arr = [...array];
+            for (let i = arr.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                const temp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = temp;
+            }
+            return arr;
+        };
+
+        // --- 解決 Issue 9: 優化 parseCsvRow，只使用狀態機管理引號，避免正則表達式二次處理衝突 ---
+        const parseCsvRow = (row) => {
+            const result = [];
+            let current = '';
+            let inQuotes = false;
+            for (let i = 0; i < row.length; i++) {
+                const char = row[i];
+                if (char === '"') {
+                    // 若遇雙引號，且下一個也是雙引號，代表為逸出雙引號 ""
+                    if (inQuotes && row[i + 1] === '"') {
+                        current += '"';
+                        i++; // 跳過下一個雙引號
+                    } else {
+                        inQuotes = !inQuotes; // 切換狀態
+                    }
+                } else if (char === ',' && !inQuotes) {
+                    result.push(current);
+                    current = '';
+                } else {
+                    current += char;
+                }
+            }
+            result.push(current);
+            return result.map(val => val.trim());
+        };
+
+        function escapeRegExp(string) {
+            return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
+        }
+
+        // --- 渲染函數 (主畫面) (解決 Issue 1 缺少的 default case) ---
+        function render() {
+            appRoot.innerHTML = '';
+            switch (appState) {
+                case 'selecting':
+                    appRoot.innerHTML = renderRoundSelector();
+                    break;
+                case 'learning':
+                    appRoot.innerHTML = renderAppContent();
+                    renderSubContent();
+                    break;
+                case 'loading_data':
+                    appRoot.innerHTML = renderLoadingScreen("資料載入中...");
+                    break;
+                case 'login':
+                default:
+                    appRoot.innerHTML = renderLoginScreen();
+                    if (error) {
+                        const errorMsgEl = document.getElementById('error-message');
+                        if (errorMsgEl) {
+                            errorMsgEl.innerText = error;
+                            errorMsgEl.classList.remove('hidden');
+                        }
+                    }
+                    break;
+            }
+            lucide.createIcons();
+        }
+
+        // --- 模板 (Template) 函數 ---
+
+        function renderLoginScreen() {
+            return `
+                <div class="w-full max-w-md text-center p-8 bg-white rounded-2xl shadow-lg">
+                    <h1 class="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-500 to-red-500 mb-4">高頻單字學習工具</h1>
+                    <p class="text-gray-600 mb-6">請輸入您的姓名或學號以同步進度</p>
+                    <form id="login-form">
+                        <div class="mb-4">
+                            <label for="student-name" class="block text-left text-sm font-medium text-gray-700 mb-2">姓名 / 學號</label>
+                            <input
+                                id="student-name"
+                                type="text"
+                                class="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                                placeholder="例如: 陳小明 或 10130"
+                                required
+                            />
+                        </div>
+                        <button id="login-button" type="submit" data-action="login" class="w-full flex items-center justify-center gap-2 px-6 py-4 rounded-lg bg-indigo-500 hover:bg-indigo-600 text-white font-semibold transition-all shadow-lg disabled:bg-indigo-300">
+                            <i data-lucide="log-in" class="w-5 h-5"></i><span>登入 / 註冊</span>
+                        </button>
+                    </form>
+                    <p id="error-message" class="mt-4 text-red-600 bg-red-100 p-3 rounded-lg ${error ? '' : 'hidden'}"></p>
+                </div>
+            `;
+        }
+
+        function renderLoadingScreen(message = "載入中...") {
+            return `
+                <div class="w-full max-w-2xl text-center p-8 bg-white rounded-2xl shadow-lg">
+                    <h1 class="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-500 to-red-500 mb-4">高頻單字學習工具</h1>
+                    <div class="flex items-center justify-center gap-3">
+                         <div class="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+                         <p class="text-gray-600 text-lg">${message}</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderRoundSelector() {
+            const availableRounds = new Set(fullVocabularyList.map(word => word.round));
+            const buttonsHtml = Array.from({ length: 40 }, (_, i) => i + 1).map(roundNum => {
+                const roundStr = String(roundNum);
+                const isAvailable = availableRounds.has(roundStr);
+                return `
+                    <button
+                        key="${roundNum}"
+                        data-action="select-round"
+                        data-round="${roundStr}"
+                        ${!isAvailable ? 'disabled' : ''}
+                        class="p-3 aspect-square rounded-lg font-bold text-lg transition-all
+                            ${isAvailable 
+                                ? 'bg-indigo-500 text-white shadow hover:bg-indigo-600' 
+                                : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                            }"
+                    >
+                        ${roundNum}
+                    </button>
+                `;
+            }).join('');
+
+            return `
+                <div class="w-full max-w-4xl mx-auto p-6 bg-white rounded-2xl shadow-lg">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 text-center">請選擇練習範圍</h2>
+                    <button 
+                        data-action="select-round"
+                        data-round="comprehensive"
+                        class="w-full mb-8 flex items-center justify-center gap-3 p-4 text-xl font-bold text-white bg-gradient-to-r from-green-500 to-teal-500 rounded-lg shadow-lg hover:scale-105 transition-transform"
+                    >
+                        <i data-lucide="layers" class="w-6 h-6"></i> 綜合練習 (全部單字)
+                    </button>
+                    <div class="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-3">
+                        ${buttonsHtml}
+                    </div>
+                    <div class="text-center mt-8">
+                        <button data-action="logout" class="flex items-center justify-center mx-auto gap-2 px-4 py-2 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700">
+                            <i data-lucide="log-out" class="w-4 h-4"></i> 登出
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderAppContent() {
+            return `
+                <div class="w-full flex flex-col items-center">
+                    <header class="w-full max-w-5xl text-center mb-8">
+                        <h1 class="text-4xl md:text-5xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-500 via-pink-500 to-red-500">高頻單字學習工具</h1>
+                        <p class="text-gray-500 mt-2">統測必考字彙・互動式學習夥伴</p>
+                        ${userId ? `<div class="mt-2 text-md text-gray-600 flex items-center justify-center gap-2"><i data-lucide="user" class="w-4 h-4"></i> 學生: <span class="font-mono font-bold">${userId}</span></div>` : ''}
+                    </header>
+                    <nav class="flex justify-center items-center gap-4 md:gap-8 mb-8 p-4 bg-white/60 backdrop-blur-sm rounded-full shadow-inner sticky top-4 z-10">
+                        ${NavButton('learn', 'book-open', '學習單字')}
+                        ${NavButton('practice', 'target', '開始練習')}
+                        ${NavButton('report', 'bar-chart-2', '學習報告')}
+                    </nav>
+                    <main id="content-main" class="w-full max-w-5xl flex-grow flex items-start justify-center"></main>
+                    <button data-action="back-to-selector" class="mt-8 flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700">
+                        <i data-lucide="home" class="w-4 h-4"></i> 返回回數選單
+                    </button>
+                </div>
+            `;
+        }
+        
+        function NavButton(targetMode, icon, label) {
+            const isActive = currentMode === targetMode;
+            return `
+                <button
+                    data-action="set-mode"
+                    data-mode="${targetMode}"
+                    class="flex flex-col items-center justify-center p-3 w-24 h-24 rounded-2xl transition-all duration-300 transform hover:-translate-y-1 shadow-md
+                        ${isActive ? 'bg-indigo-500 text-white shadow-lg' : 'bg-white text-gray-600 hover:bg-indigo-100'}"
+                >
+                    <i data-lucide="${icon}" class="w-7 h-7"></i>
+                    <span class="mt-1 text-sm font-semibold">${label}</span>
+                </button>
+            `;
+        }
+
+        // --- 渲染函數 (子內容) (解決 Issue 1 缺少的 default case) ---
+        function renderSubContent() {
+            const main = document.getElementById('content-main');
+            if (!main) return;
+
+            switch (currentMode) {
+                case 'practice':
+                    main.innerHTML = renderPracticeMode();
+                    break;
+                case 'report':
+                    main.innerHTML = renderProgressReport();
+                    break;
+                case 'learn':
+                default:
+                    main.innerHTML = renderLearningMode();
+                    break;
+            }
+            lucide.createIcons();
+        }
+
+        // --- 子內容渲染函數 ---
+        function renderLearningMode() {
+            const word = selectedVocabularyList[currentWordIndex];
+            if (!word) return `<p>沒有單字可供學習。</p>`;
+            const cardColors = ['bg-blue-100', 'bg-green-100', 'bg-yellow-100', 'bg-purple-100', 'bg-pink-100'];
+            // 解決 Issue 4: 從未重新賦值之變數使用 const
+            const randomColor = cardColors[Math.floor(Math.random() * cardColors.length)];
+            
+            return `
+                <div class="w-full max-w-2xl mx-auto p-4 md:p-6">
+                    <div class="rounded-2xl shadow-lg p-6 md:p-8 transition-all duration-500 ${randomColor}">
+                        <div class="flex justify-between items-start mb-4">
+                            <div>
+                                <h1 class="text-4xl md:text-5xl font-bold text-gray-800">${word.en}</h1>
+                                <p class="text-gray-500 font-semibold mt-1">回數: ${word.round}</p>
+                            </div>
+                            <button data-action="speak" data-text="${word.en}" class="p-3 rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-transform transform hover:scale-110 shadow-md">
+                                <i data-lucide="volume-2" class="w-7 h-7"></i>
+                            </button>
+                        </div>
+                        <div class="space-y-5 mt-6">
+                            <div class="p-4 bg-white/70 rounded-lg">
+                                <p class="text-xl md:text-2xl text-gray-700 font-semibold">${word.zh}</p>
+                                <p class="text-sm text-gray-500">中文意思</p>
+                            </div>
+                            <div class="p-4 bg-white/70 rounded-lg cursor-pointer hover:bg-white" data-action="speak" data-text="${word.sentence}">
+                                <p class="text-lg text-gray-800">${word.sentence}</p>
+                                <p class="text-sm text-gray-500 mt-2">例句</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex justify-between mt-8">
+                        <button data-action="prev-word" class="flex items-center gap-2 px-6 py-3 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold transition-transform transform hover:scale-105">
+                            <i data-lucide="arrow-left" class="w-5 h-5"></i> 上一個
+                        </button>
+                        <button data-action="next-word" class="flex items-center gap-2 px-6 py-3 rounded-lg bg-indigo-500 hover:bg-indigo-600 text-white font-semibold transition-transform transform hover:scale-105 shadow-lg">
+                            下一個 <i data-lucide="arrow-right" class="w-5 h-5"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderProgressReport() {
+            const masteredCount = Object.values(progress).filter(p => p.status === 'mastered').length;
+            const learningCount = Object.values(progress).filter(p => p.status === 'learning').length;
+            const totalWords = selectedVocabularyList.length;
+            const progressPercent = totalWords > 0 ? Math.round((masteredCount / totalWords) * 100) : 0;
+
+            const wordsHtml = selectedVocabularyList.map(word => {
+                const wordProgress = progress[word.en];
+                let statusColor = 'bg-gray-200 text-gray-500';
+                let statusIcon = '<span class="text-xs">未開始</span>';
+                if (wordProgress) {
+                    if (wordProgress.status === 'mastered') {
+                        statusColor = 'bg-green-200 text-green-800';
+                        statusIcon = '<i data-lucide="check-circle" class="w-4 h-4 text-green-600"></i>';
+                    } else if (wordProgress.status === 'learning') {
+                        statusColor = 'bg-yellow-200 text-yellow-800';
+                        statusIcon = '<i data-lucide="star" class="w-4 h-4 text-yellow-500"></i>';
+                    }
+                }
+                return `
+                    <div 
+                        data-action="show-word-detail"
+                        data-word-en="${word.en}"
+                        class="p-3 rounded-lg flex justify-between items-center text-left w-full ${statusColor} hover:bg-indigo-100 hover:shadow-md transition-all duration-200 cursor-pointer"
+                    >
+                        <span class="font-medium">${word.en}</span>
+                        ${statusIcon}
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="w-full max-w-4xl mx-auto p-6 bg-gray-50 rounded-2xl shadow-lg">
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6 text-center">個人學習報告</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8 text-center">
+                        <div class="p-4 bg-green-100 rounded-lg"><p class="text-4xl font-bold text-green-600">${masteredCount}</p><p class="text-gray-600">已掌握</p></div>
+                        <div class="p-4 bg-yellow-100 rounded-lg"><p class="text-4xl font-bold text-yellow-600">${learningCount}</p><p class="text-gray-600">學習中</p></div>
+                        <div class="p-4 bg-blue-100 rounded-lg"><p class="text-4xl font-bold text-blue-600">${totalWords - masteredCount - learningCount}</p><p class="text-gray-600">未學習</p></div>
+                    </div>
+                    <div class="mb-8">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-2">總體進度</h3>
+                        <div class="w-full bg-gray-200 rounded-full h-6">
+                            <div class="bg-gradient-to-r from-green-400 to-blue-500 h-6 rounded-full text-center text-white font-bold flex items-center justify-center" style="width: ${progressPercent}%">${progressPercent}%</div>
+                        </div>
+                    </div>
+                    <div>
+                        <h3 class="text-xl font-semibold text-gray-700 mb-4">單字詳情</h3>
+                        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                            ${wordsHtml}
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 單字詳情懸浮視窗 -->
+                <div id="word-detail-popover" class="hidden fixed z-50 p-4 bg-white rounded-lg shadow-xl border border-gray-200 w-full max-w-sm pointer-events-none transition-opacity duration-150 ease-in-out">
+                    <h2 id="popover-en" class="text-2xl font-bold text-indigo-600 mb-2"></h2>
+                    <div class="space-y-2">
+                        <div class="p-2 bg-gray-100 rounded-md">
+                            <p id="popover-zh" class="text-lg text-gray-800"></p>
+                            <p class="text-sm text-gray-500 mt-1">中文意思</p>
+                        </div>
+                        <div class="p-2 bg-gray-100 rounded-md">
+                            <p id="popover-sentence" class="text-base text-gray-800 break-words"></p>
+                            <p class="text-sm text-gray-500 mt-1">例句</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // --- 練習模式相關函數 ---
+        let currentPracticeType = null;
+        let practiceState = {}; 
+        
+        // 解決 Issue 1 & 新問題：renderPracticeMode() 中的 switch 補上 default case，並安全移除 onclick 殘留
+        function renderPracticeMode() {
+            if (!currentPracticeType) {
+                return `
+                    <div class="text-center p-4">
+                        <h2 class="text-3xl font-bold mb-8 text-gray-700">選擇練習模式</h2>
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-4xl mx-auto">
+                            <button data-action="set-practice" data-type="choice-meaning" class="p-6 rounded-xl bg-teal-400 text-white font-bold text-xl hover:bg-teal-500 transition-transform transform hover:-translate-y-1 shadow-lg">單字選義</button>
+                            <button data-action="set-practice" data-type="choice-sentence" class="p-6 rounded-xl bg-amber-400 text-white font-bold text-xl hover:bg-amber-500 transition-transform transform hover:-translate-y-1 shadow-lg">克漏字</button>
+                            <button data-action="set-practice" data-type="match-meaning" class="p-6 rounded-xl bg-cyan-400 text-white font-bold text-xl hover:bg-cyan-500 transition-transform transform hover:-translate-y-1 shadow-lg">單字配對</button>
+                            <button data-action="set-practice" data-type="spelling" class="p-6 rounded-xl bg-rose-400 text-white font-bold text-xl hover:bg-rose-500 transition-transform transform hover:-translate-y-1 shadow-lg">拼字練習</button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const practiceHtml = `
+                <div class="w-full">
+                    <button data-action="set-practice" data-type="" class="mb-4 flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700">
+                        <i data-lucide="arrow-left" class="w-4 h-4"></i>返回選單
+                    </button>
+                    <div id="practice-content"></div>
+                </div>
+            `;
+            // 立即渲染框架，稍後填充內容
+            setTimeout(() => {
+                const practiceContent = document.getElementById('practice-content');
+                if (!practiceContent) return;
+
+                switch (currentPracticeType) {
+                    case 'choice-meaning':
+                        if (selectedVocabularyList.length < 4) {
+                            practiceContent.innerHTML = `<div class="text-center p-4">需要至少4個單字才能進行此練習。</div>`;
+                            return;
+                        }
+                        if (!practiceState.currentWord) { 
+                            generatePracticeQuestion('choice-meaning');
+                        }
+                        practiceContent.innerHTML = renderMultipleChoiceMeaning();
+                        break;
+                    case 'choice-sentence':
+                         if (selectedVocabularyList.length < 4) {
+                            practiceContent.innerHTML = `<div class="text-center p-4">需要至少4個單字才能進行此練習。</div>`;
+                            return;
+                        }
+                        if (practiceState.isComplete) {
+                            practiceContent.innerHTML = renderPracticeComplete('克漏字');
+                        } else if (!practiceState.currentWord) {
+                            generatePracticeQuestion('choice-sentence');
+                            if (practiceState.isComplete) {
+                                practiceContent.innerHTML = renderPracticeComplete('克漏字');
+                            } else {
+                                practiceContent.innerHTML = renderMultipleChoiceSentence();
+                            }
+                        } else {
+                             practiceContent.innerHTML = renderMultipleChoiceSentence();
+                        }
+                        break;
+                    case 'match-meaning':
+                         if (selectedVocabularyList.length < 5) {
+                            practiceContent.innerHTML = `<div class="text-center p-4">需要至少5個單字才能進行此練習。</div>`;
+                            return;
+                        }
+                        if (!practiceState.gameWords) { 
+                            generatePracticeQuestion('match-meaning');
+                        }
+                        if (practiceState.isComplete) {
+                             practiceContent.innerHTML = renderPracticeComplete('單字配對');
+                        } else {
+                            practiceContent.innerHTML = renderMatchingPractice();
+                        }
+                        break;
+                    case 'spelling':
+                        if (selectedVocabularyList.length === 0) {
+                            practiceContent.innerHTML = `<div class="text-center p-4">沒有單字可供練習。</div>`;
+                            return;
+                        }
+                        if (!practiceState.currentWord) {
+                            generatePracticeQuestion('spelling');
+                        }
+                        practiceContent.innerHTML = renderSpellingPractice();
+                        break;
+                    default:
+                        practiceContent.innerHTML = `<div class="text-center p-4">未知的練習模式。</div>`;
+                        break;
+                }
+                lucide.createIcons();
+            }, 0);
+            
+            return practiceHtml;
+        }
+        
+        // 解決 Issue 1 & 6: generatePracticeQuestion() 中的 switch 補上 default case，並徹底修正選擇正確時有偏差的洗牌算法
+        function generatePracticeQuestion(type) {
+            practiceState = { feedback: null };
+            const words = selectedVocabularyList;
+
+            switch (type) {
+                case 'choice-meaning': {
+                    const randomWord = words[Math.floor(Math.random() * words.length)];
+                    // 先過濾出錯誤單字，使用無偏差 shuffle 隨機排列，取前 3 個
+                    const wrongOptions = shuffleArray(
+                        words.filter(w => w.en !== randomWord.en)
+                    ).slice(0, 3).map(w => w.zh);
+                    
+                    practiceState.currentWord = randomWord;
+                    practiceState.options = shuffleArray([...wrongOptions, randomWord.zh]);
+                    break;
+                }
+                case 'choice-sentence': {
+                    const allValidQuestions = words.filter(w => w.sentence && w.sentence.toLowerCase().includes(w.en.toLowerCase()));
+                    practiceState.questionDeck = shuffleArray(allValidQuestions);
+                    practiceState.reviewPile = [];
+                    practiceState.newQuestionCounter = 0;
+                    practiceState.isComplete = false;
+                    loadNextClozeQuestion();
+                    break;
+                }
+                case 'match-meaning': {
+                    const selected = shuffleArray(words).slice(0, 5);
+                    practiceState.gameWords = shuffleArray(selected);
+                    practiceState.meanings = shuffleArray(selected.map(w => ({ zh: w.zh, en: w.en })));
+                    practiceState.selectedWord = null;
+                    practiceState.selectedMeaning = null;
+                    practiceState.matchedPairs = [];
+                    break;
+                }
+                case 'spelling': {
+                    const randomWord = words[Math.floor(Math.random() * words.length)];
+                    practiceState.currentWord = randomWord;
+                    setTimeout(() => speak(randomWord.en), 300);
+                    break;
+                }
+                default:
+                    console.warn("generatePracticeQuestion: Unknown type:", type);
+                    break;
+            }
+        }
+
+        // 解決 Issue 6: 修正 loadNextClozeQuestion 中產生錯誤選項時的偏差洗牌問題
+        function loadNextClozeQuestion() {
+            practiceState.feedback = null;
+            practiceState.currentWord = null;
+
+            if (practiceState.newQuestionCounter >= 3 && practiceState.reviewPile.length > 0) {
+                practiceState.currentWord = practiceState.reviewPile.shift();
+                practiceState.newQuestionCounter = 0;
+            } 
+            else if (practiceState.questionDeck.length > 0) {
+                practiceState.currentWord = practiceState.questionDeck.shift();
+                practiceState.newQuestionCounter++;
+            }
+            else if (practiceState.reviewPile.length > 0) {
+                practiceState.currentWord = practiceState.reviewPile.shift();
+                practiceState.newQuestionCounter = 0;
+            }
+            else {
+                practiceState.isComplete = true;
+            }
+
+            if (practiceState.currentWord) {
+                const randomWord = practiceState.currentWord;
+                const answerKey = randomWord.root || randomWord.en; 
+
+                // 使用無偏差的 Fisher-Yates 洗牌再行切片
+                const wrongOptions = shuffleArray(
+                    selectedVocabularyList.filter(w => (w.root || w.en) !== answerKey)
+                ).slice(0, 3).map(w => w.root || w.en);
+                
+                practiceState.options = shuffleArray([...wrongOptions, answerKey]);
+            }
+        }
+
+        function renderPracticeComplete(practiceName) {
+            return `
+                <div class="text-center p-8 bg-green-100 rounded-2xl shadow-md">
+                    <h3 class="text-3xl font-bold text-green-800 mb-2">恭喜完成！</h3>
+                    <p class="text-lg text-gray-700 mb-6">您已完成本回的「${practiceName}」練習。</p>
+                    <button 
+                        data-action="practice-reset" 
+                        class="px-6 py-3 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 transition-all"
+                    >
+                        <i data-lucide="refresh-cw" class="w-4 h-4 inline-block mr-2"></i> 再練習一次
+                    </button>
+                </div>
+            `;
+        }
+        
+        // --- 練習模式的渲染函數 ---
+        
+        function renderMultipleChoiceMeaning() {
+            const { currentWord, options, feedback } = practiceState;
+            if (!currentWord) return `<div>載入中...</div>`;
+            
+            // *** 優化樣式邏輯 (視覺強顯) ***
+            const optionsHtml = options.map((opt, index) => {
+                let btnClass = "bg-white hover:bg-teal-50 border-teal-200 text-gray-700";
+                let iconHtml = "";
+                
+                if (feedback) {
+                    if (opt === currentWord.zh) {
+                        btnClass = "bg-green-500 border-green-600 text-white ring-2 ring-green-300";
+                        iconHtml = '<i data-lucide="check-circle" class="inline-block w-5 h-5 mr-2"></i>';
+                    } else if (!feedback.correct && opt === feedback.selected) {
+                        btnClass = "bg-red-500 border-red-600 text-white";
+                        iconHtml = '<i data-lucide="x-circle" class="inline-block w-5 h-5 mr-2"></i>';
+                    } else {
+                        btnClass = "bg-gray-100 border-gray-200 text-gray-400 opacity-50";
+                    }
+                }
+
+                return `
+                    <button 
+                        key="${index}"
+                        data-action="practice-answer"
+                        data-index="${index}" 
+                        ${feedback ? 'disabled' : ''}
+                        class="p-4 rounded-lg text-lg font-semibold transition-all duration-300 border-2 ${btnClass} flex items-center justify-center"
+                    >
+                        ${iconHtml}
+                        ${opt}
+                    </button>
+                `;
+            }).join('');
+
+            return `
+                <div class="max-w-xl mx-auto p-6 bg-teal-100 rounded-2xl shadow-md">
+                    <h3 class="text-center text-3xl font-bold text-teal-800 mb-6">${currentWord.en}</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        ${optionsHtml}
+                    </div>
+                    ${feedback ? `
+                        <div class="mt-4 text-center">
+                            <p class="text-xl font-bold ${feedback.correct ? 'text-green-600' : 'text-red-600'}">
+                                ${feedback.correct ? '答對了！' : `答錯了，正確答案是 ${feedback.answer}`}
+                            </p>
+                            <button data-action="next-question" class="mt-4 px-6 py-2 bg-indigo-500 text-white font-semibold rounded-lg hover:bg-indigo-600">
+                                下一題 <i data-lucide="arrow-right" class="w-4 h-4 inline-block"></i>
+                            </button>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        }
+
+        function renderMultipleChoiceSentence() {
+            if (practiceState.isComplete) {
+                return renderPracticeComplete('克漏字');
+            }
+            if(practiceState.noQuestion) return `<div class="text-center p-4">載入題目中，或沒有可用的例句...</div>`;
+            const { currentWord, options, feedback } = practiceState;
+            if (!currentWord) return `<div>載入中...</div>`;
+
+            let sentenceHtml = currentWord.sentence;
+            if (currentWord.synonyms && currentWord.synonyms.length > 0) {
+                currentWord.synonyms.forEach(syn => {
+                    if (syn) {
+                        const regex = new RegExp(`\\b(${escapeRegExp(syn)})\\b`, 'gi');
+                        sentenceHtml = sentenceHtml.replace(regex, 
+                            '<span class="underline decoration-blue-500 decoration-double decoration-2 font-bold">$1</span>'
+                        );
+                    }
+                });
+            }
+            const sentenceWithBlank = sentenceHtml.replace(new RegExp(`\\b${escapeRegExp(currentWord.en)}\\b`, 'gi'), '______');
+            const isAtStart = sentenceHtml.trim().toLowerCase().startsWith(currentWord.en.toLowerCase());
+            const answerKey = currentWord.root || currentWord.en;
+
+            const optionsHtml = options.map((opt, index) => {
+                let displayOpt = opt;
+                if (isAtStart) {
+                    displayOpt = opt.charAt(0).toUpperCase() + opt.slice(1);
+                }
+
+                let btnClass = "bg-white hover:bg-amber-50 border-amber-200 text-gray-700";
+                let iconHtml = "";
+
+                if (feedback) {
+                    if (opt === answerKey) {
+                        btnClass = "bg-green-500 border-green-600 text-white ring-2 ring-green-300";
+                        iconHtml = '<i data-lucide="check-circle" class="inline-block w-5 h-5 mr-2"></i>';
+                    } else if (!feedback.correct && opt === feedback.selected) {
+                        btnClass = "bg-red-500 border-red-600 text-white";
+                        iconHtml = '<i data-lucide="x-circle" class="inline-block w-5 h-5 mr-2"></i>';
+                    } else {
+                        btnClass = "bg-gray-100 border-gray-200 text-gray-400 opacity-50";
+                    }
+                }
+
+                return `
+                    <button 
+                        key="${index}"
+                        data-action="practice-answer"
+                        data-index="${index}"
+                        ${feedback ? 'disabled' : ''}
+                        class="p-4 rounded-lg text-lg font-semibold transition-all duration-300 border-2 ${btnClass} flex items-center justify-center"
+                    >
+                        ${iconHtml}
+                        ${displayOpt}
+                    </button>
+                `;
+            }).join('');
+            
+            return `
+                <div class="max-w-2xl mx-auto p-6 bg-amber-100 rounded-2xl shadow-md">
+                    <p class="text-center text-xl text-amber-900 mb-6 leading-relaxed">${sentenceWithBlank}</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        ${optionsHtml}
+                    </div>
+                    ${feedback ? `
+                        <div class="mt-4 text-center">
+                            <p class="text-lg font-bold ${feedback.correct ? 'text-green-600' : 'text-red-600'}">
+                                ${feedback.correct ? '太棒了！' : `再試試看，正確單字是 ${feedback.answer}`}
+                            </p>
+                            <button data-action="next-question" class="mt-4 px-6 py-2 bg-indigo-500 text-white font-semibold rounded-lg hover:bg-indigo-600">
+                                下一題 <i data-lucide="arrow-right" class="w-4 h-4 inline-block"></i>
+                            </button>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        }
+
+        function renderMatchingPractice() {
+            const { gameWords, meanings, selectedWord, selectedMeaning, matchedPairs } = practiceState;
+            
+            // 解決 Issue 8: 消除配對長度的硬編碼魔法數字
+            if (matchedPairs.length === gameWords.length) {
+                return renderPracticeComplete('單字配對');
+            }
+
+            const wordsHtml = gameWords.map(word => `
+                <button 
+                    data-action="match-word"
+                    data-word-en="${word.en}"
+                    ${matchedPairs.includes(word.en) ? 'disabled' : ''}
+                    class="p-4 rounded-lg text-lg font-semibold transition-all duration-200
+                        ${matchedPairs.includes(word.en) ? 'bg-gray-300 text-gray-500 line-through' : ''}
+                        ${selectedWord?.en === word.en ? 'bg-cyan-500 text-white ring-2 ring-cyan-700' : 'bg-white hover:bg-cyan-200'}
+                    "
+                >
+                    ${word.en}
+                </button>
+            `).join('');
+
+            const meaningsHtml = meanings.map(meaning => `
+                <button 
+                    data-action="match-meaning"
+                    data-meaning-en="${meaning.en}"
+                    data-meaning-zh="${meaning.zh}"
+                    ${matchedPairs.includes(meaning.en) ? 'disabled' : ''}
+                    class="p-4 rounded-lg text-lg font-semibold transition-all duration-200
+                        ${matchedPairs.includes(meaning.en) ? 'bg-gray-300 text-gray-500 line-through' : ''}
+                        ${selectedMeaning?.zh === meaning.zh ? 'bg-cyan-500 text-white ring-2 ring-cyan-700' : 'bg-white hover:bg-cyan-200'}
+                    "
+                >
+                    ${meaning.zh}
+                </button>
+            `).join('');
+
+            return `
+                <div class="max-w-2xl mx-auto p-6 bg-cyan-100 rounded-2xl shadow-md">
+                    <h3 class="text-center text-2xl font-bold text-cyan-800 mb-6">單字配對</h3>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="flex flex-col gap-3">${wordsHtml}</div>
+                        <div class="flex flex-col gap-3">${meaningsHtml}</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderSpellingPractice() {
+            const { currentWord, feedback } = practiceState;
+            if (!currentWord) return `<div>載入中...</div>`;
+            return `
+                <div class="max-w-xl mx-auto p-6 bg-rose-100 rounded-2xl shadow-md">
+                    <h3 class="text-center text-2xl font-bold text-rose-800 mb-4">聽發音，拼出單字</h3>
+                    <div class="flex justify-center mb-6">
+                        <button data-action="speak" data-text="${currentWord.en}" class="p-4 rounded-full bg-rose-500 text-white hover:bg-rose-600 transition-transform transform hover:scale-110 shadow-md">
+                            <i data-lucide="volume-2" class="w-8 h-8"></i>
+                        </button>
+                    </div>
+                    <form id="spelling-form" class="flex flex-col items-center gap-4">
+                        <input
+                            id="spelling-input"
+                            type="text"
+                            class="w-full max-w-sm p-4 text-2xl text-center border-2 border-rose-300 rounded-lg focus:ring-2 focus:ring-rose-500 focus:outline-none"
+                            placeholder="輸入單字"
+                            ${feedback ? 'disabled' : ''}
+                        />
+                        <button type="submit" ${feedback ? 'disabled' : ''} class="px-8 py-3 bg-rose-500 text-white font-bold rounded-lg hover:bg-rose-600 transition-colors">送出</button>
+                    </form>
+                    ${feedback ? `
+                        <div class="mt-4 text-center">
+                            <p class="text-xl font-bold ${feedback.correct ? 'text-green-600' : 'text-red-600'}">
+                                ${feedback.correct ? '<i data-lucide="check-circle" class="inline-block mr-2"></i>拼寫正確！' : `<i data-lucide="x-circle" class="inline-block mr-2"></i>答錯了，正確拼法是 ${feedback.answer}`}
+                            </p>
+                            <!-- *** 變更 2：加入下一題按鈕 *** -->
+                            <button data-action="next-question" class="mt-4 px-6 py-2 bg-indigo-500 text-white font-semibold rounded-lg hover:bg-indigo-600">
+                                下一題 <i data-lucide="arrow-right" class="w-4 h-4 inline-block"></i>
+                            </button>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        }
+
+        // --- 事件處理函數 ---
+        
+        function handleLogin() {
+            const nameInput = document.getElementById('student-name');
+            const studentName = nameInput.value.trim();
+            if (!studentName) {
+                error = "姓名或學號不可為空";
+                render();
+                return;
+            }
+            
+            userId = studentName; // 將學生姓名/學號設置為 userId
+            appState = 'loading_data';
+            error = null;
+            render();
+
+            handleFetchData();
+        }
+
+        async function handleFetchData() {
+            if (!sheetUrl) {
+                error = '未設定 Google Sheets CSV 網址。';
+                appState = 'login';
+                render();
+                return;
+            }
+            try {
+                // 優先使用直接 Fetch 載入（大部分現代瀏覽器支援 Google Sheets 發布網址的直接跨域讀取）
+                let response;
+                try {
+                    response = await fetch(sheetUrl);
+                } catch (fetchErr) {
+                    console.warn("Direct fetch failed, trying corsproxy.io proxy:", fetchErr);
+                    try {
+                        response = await fetch(`https://corsproxy.io/?${encodeURIComponent(sheetUrl)}`);
+                    } catch (proxy1Err) {
+                        console.warn("corsproxy.io failed, trying api.codetabs.com proxy:", proxy1Err);
+                        try {
+                            response = await fetch(`https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(sheetUrl)}`);
+                        } catch (proxy2Err) {
+                            console.warn("api.codetabs.com failed, trying api.allorigins.win proxy:", proxy2Err);
+                            response = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(sheetUrl)}`);
+                        }
+                    }
+                }
+
+                if (!response.ok) throw new Error(`HTTP 錯誤！ 狀態: ${response.status}`);
+                const csvText = await response.text();
+                
+                const normalizedText = csvText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                const rows = normalizedText.split('\n').slice(1);
+                
+                const data = rows.map(row => {
+                    if (!row.trim()) return null;
+                    const columns = parseCsvRow(row);
+                    if (columns && columns.length >= 4) {
+                        const synonyms = (columns[4] || '')
+                            .split(',')
+                            .map(s => s.trim())
+                            .filter(Boolean); 
+                        
+                        const root = columns[5] ? columns[5].trim() : null; 
+
+                        return { 
+                            round: columns[0], 
+                            en: columns[1], 
+                            zh: columns[2], 
+                            sentence: columns[3],
+                            synonyms: synonyms, 
+                            root: root 
+                        };
+                    }
+                    return null;
+                }).filter(item => item && item.en && item.round);
+
+                if (data.length === 0) throw new Error('無法從網址解析出有效的單字資料，請檢查網址與格式。');
+
+                fullVocabularyList = data;
+                appState = 'selecting';
+            } catch (fetchError) {
+                // 解決 Issue 2: 將 catch (e) 重新命名為 fetchError，避免遮蔽全域變數 error
+                error = `載入失敗: ${fetchError.message}。請檢查網址是否正確，且已設定為「向知道連結的任何人」發布。`;
+                appState = 'login';
+                console.error(fetchError);
+            } finally {
+                render();
+            }
+        }
+
+        function handleSelectRound(round) {
+            selectedRound = round;
+            if (round === 'comprehensive') {
+                selectedVocabularyList = fullVocabularyList;
+            } else {
+                selectedVocabularyList = fullVocabularyList.filter(word => word.round === round);
+            }
+            appState = 'learning';
+            currentMode = 'learn';
+            currentWordIndex = 0;
+            progress = {}; 
+            setupFirebaseProgressListeners();
+            render();
+        }
+
+        function handleSetMode(mode) {
+            currentMode = mode;
+            currentPracticeType = null; 
+            practiceState = {};
+            render(); 
+            renderSubContent(); 
+        }
+        
+        function handlePracticeAnswer(indexStr) {
+            if (practiceState.feedback) return;
+            const index = parseInt(indexStr, 10);
+            const answer = practiceState.options[index]; 
+            
+            let isCorrect;
+            let correctAnswer;
+
+            if (currentPracticeType === 'choice-meaning') {
+                isCorrect = answer === practiceState.currentWord.zh;
+                correctAnswer = practiceState.currentWord.zh;
+                practiceState.feedback = { correct: isCorrect, answer: correctAnswer, selected: answer };
+                updateProgress(practiceState.currentWord.en, isCorrect);
+            } else if (currentPracticeType === 'choice-sentence') {
+                const answerKey = practiceState.currentWord.root || practiceState.currentWord.en;
+                isCorrect = answer === answerKey;
+                correctAnswer = answerKey;
+                practiceState.feedback = { correct: isCorrect, answer: correctAnswer, selected: answer };
+                practiceState.lastAnswerCorrect = isCorrect;
+                updateProgress(practiceState.currentWord.en, isCorrect);
+            }
+            
+            renderSubContent(); 
+        }
+        
+        function handleMatchWord(wordEn) {
+            practiceState.selectedWord = practiceState.gameWords.find(w => w.en === wordEn);
+            checkMatch();
+        }
+
+        function handleMatchMeaning(meaningEn, meaningZh) {
+            practiceState.selectedMeaning = { en: meaningEn, zh: meaningZh };
+            checkMatch();
+        }
+
+        function checkMatch() {
+            const { selectedWord, selectedMeaning } = practiceState;
+            if (selectedWord && selectedMeaning) {
+                const isCorrect = selectedWord.en === selectedMeaning.en;
+                updateProgress(selectedWord.en, isCorrect);
+                
+                if (isCorrect) {
+                    practiceState.matchedPairs.push(selectedWord.en);
+                }
+
+                setTimeout(() => {
+                    practiceState.selectedWord = null;
+                    practiceState.selectedMeaning = null;
+                    renderSubContent(); 
+                }, 500);
+            }
+            renderSubContent(); 
+        }
+
+        function handleSpellingSubmit() {
+            const input = document.getElementById('spelling-input');
+            const inputValue = input.value.trim();
+            if (!inputValue || practiceState.feedback) return;
+
+            const isCorrect = inputValue.toLowerCase() === practiceState.currentWord.en.toLowerCase();
+            practiceState.feedback = { correct: isCorrect, answer: practiceState.currentWord.en };
+            updateProgress(practiceState.currentWord.en, isCorrect);
+            renderSubContent(); 
+        }
+
+        // --- Firebase 相關 ---
+        
+        function setupFirebaseProgressListeners() {
+            if (!userId || !selectedRound) return;
+            
+            // 使用符合規則的用戶私有路徑
+            const progressColPath = `artifacts/${appId}/users/${userId}/vocabulary_progress_${selectedRound}`;
+            const colRef = collection(db, progressColPath);
+            // 解決 Issue 2: 將這裡的隨附 error 重新命名為 progressError，避免與全域變數 error 衝突
+            onSnapshot(colRef, (snapshot) => {
+                const newProgress = {};
+                snapshot.forEach(docSnap => { newProgress[docSnap.id] = docSnap.data(); });
+                progress = newProgress;
+                if (currentMode === 'report' && appState === 'learning') {
+                    renderSubContent();
+                }
+            }, (progressError) => console.error("Error listening to progress:", progressError));
+        }
+
+        async function updateProgress(word, isCorrect) {
+            if (!userId || !word || !selectedRound) return;
+            // 使用符合規則的用戶私有路徑
+            const progressRef = doc(db, `artifacts/${appId}/users/${userId}/vocabulary_progress_${selectedRound}`, word);
+            const currentData = progress[word] || { correct: 0, incorrect: 0, status: 'learning' };
+            const newCorrect = currentData.correct + (isCorrect ? 1 : 0);
+            const newIncorrect = currentData.incorrect + (isCorrect ? 0 : 1);
+            let newStatus = 'learning';
+            if (newCorrect >= 3 && newCorrect > newIncorrect * 2) newStatus = 'mastered';
+            try { 
+                await setDoc(progressRef, { correct: newCorrect, incorrect: newIncorrect, status: newStatus }, { merge: true });
+                progress[word] = { correct: newCorrect, incorrect: newIncorrect, status: newStatus };
+            } 
+            // 解決 Issue 2: 將 catch (error) 重新命名為 writeError，避免遮蔽全域變數 error
+            catch (writeError) { console.error("Failed to update progress:", writeError); }
+        }
+
+        // --- 全局事件監聽器 (解決 Issue 1 補齊 default case) ---
+        appRoot.addEventListener('click', (e) => {
+            const target = e.target.closest('[data-action]');
+            if (!target) return;
+
+            const action = target.dataset.action;
+            switch (action) {
+                case 'logout':
+                    appState = 'login';
+                    fullVocabularyList = [];
+                    selectedVocabularyList = [];
+                    userId = null;
+                    progress = {};
+                    error = null; 
+                    render();
+                    break;
+                case 'back-to-selector':
+                    appState = 'selecting';
+                    selectedVocabularyList = [];
+                    currentPracticeType = null; 
+                    practiceState = {};
+                    render();
+                    break;
+                case 'select-round':
+                    handleSelectRound(target.dataset.round);
+                    break;
+                case 'set-mode':
+                    handleSetMode(target.dataset.mode);
+                    break;
+                case 'set-practice':
+                    currentPracticeType = target.dataset.type || null;
+                    practiceState = {}; 
+                    if(currentPracticeType) {
+                        generatePracticeQuestion(currentPracticeType);
+                    }
+                    renderSubContent();
+                    break;
+                case 'speak':
+                    speak(target.dataset.text);
+                    break;
+                case 'next-word':
+                    currentWordIndex = (currentWordIndex + 1) % selectedVocabularyList.length;
+                    renderSubContent();
+                    break;
+                case 'prev-word':
+                    currentWordIndex = (currentWordIndex - 1 + selectedVocabularyList.length) % selectedVocabularyList.length;
+                    renderSubContent();
+                    break;
+                case 'practice-answer':
+                    handlePracticeAnswer(target.dataset.index);
+                    break;
+                case 'match-word':
+                    handleMatchWord(target.dataset.wordEn);
+                    break;
+                case 'match-meaning':
+                    handleMatchMeaning(target.dataset.meaningEn, target.dataset.meaningZh);
+                    break;
+                case 'practice-reset':
+                    practiceState.reviewPile = [];
+                    practiceState.questionDeck = [];
+                    generatePracticeQuestion(currentPracticeType);
+                    renderSubContent();
+                    break;
+                case 'next-question':
+                    if (currentPracticeType === 'choice-sentence') {
+                        if (practiceState.lastAnswerCorrect === false) {
+                            practiceState.reviewPile.push(practiceState.currentWord);
+                        }
+                        loadNextClozeQuestion(); 
+                    } 
+                    else {
+                        generatePracticeQuestion(currentPracticeType);
+                    }
+                    renderSubContent();
+                    break;
+                default:
+                    break;
+            }
+        });
+
+        appRoot.addEventListener('submit', (e) => {
+            e.preventDefault();
+            if (e.target.id === 'login-form') {
+                handleLogin();
+            } else if (e.target.id === 'spelling-form') {
+                handleSpellingSubmit();
+            }
+        });
+
+        // --- 懸浮視窗事件監聽 ---
+
+        // 解決 Issue 10: 改善 positionPopover 的測量時機，避免在某些極端情況下 offset 讀取為 0 或造成重繪
+        function positionPopover(popover, x, y) {
+            // 先將元素移到隱蔽區域渲染以精確測量尺寸
+            popover.style.left = '-9999px';
+            popover.style.top = '-9999px';
+            popover.style.display = 'block';
+            popover.classList.remove('hidden');
+
+            const popoverWidth = popover.offsetWidth;
+            const popoverHeight = popover.offsetHeight;
+            
+            const margin = 10; 
+            let left = x + margin;
+            let top = y + margin;
+
+            if (left + popoverWidth + margin > window.innerWidth) {
+                left = x - popoverWidth - margin; 
+            }
+            if (top + popoverHeight + margin > window.innerHeight) {
+                top = y - popoverHeight - margin; 
+            }
+            if (left < margin) left = margin;
+            if (top < margin) top = margin;
+
+            popover.style.left = `${left}px`;
+            popover.style.top = `${top}px`;
+        }
+
+        appRoot.addEventListener('mouseover', (e) => {
+            if (appState !== 'learning' || currentMode !== 'report') return;
+
+            const target = e.target.closest('[data-action="show-word-detail"]');
+            if (target) {
+                const en = target.dataset.wordEn;
+                const word = selectedVocabularyList.find(w => w.en === en);
+                const popover = document.getElementById('word-detail-popover');
+                
+                if (word && popover) {
+                    document.getElementById('popover-en').innerText = word.en;
+                    document.getElementById('popover-zh').innerText = word.zh;
+                    document.getElementById('popover-sentence').innerText = word.sentence || '(無例句)';
+                    
+                    positionPopover(popover, e.clientX, e.clientY);
+                }
+            }
+        });
+
+        appRoot.addEventListener('mouseout', (e) => {
+            if (appState !== 'learning' || currentMode !== 'report') return;
+
+            const target = e.target.closest('[data-action="show-word-detail"]');
+            if (target) {
+                const popover = document.getElementById('word-detail-popover');
+                if (popover) {
+                    popover.classList.add('hidden');
+                    popover.style.left = '0px';
+                    popover.style.top = '0px';
+                }
+            }
+        });
+
+        // --- 初始化安全登入流程 (Rule 3) ---
+        const initAuth = async () => {
+            const isSystemConfig = typeof __firebase_config !== 'undefined';
+            try {
+                if (isSystemConfig && typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                console.log("Firebase Auth success.");
+            } 
+            // 解決 Issue 2: 將 catch (error) 重新命名為 authError，避免遮蔽全域變數 error
+            catch (authError) {
+                if (authError.code === 'auth/custom-token-mismatch') {
+                    // 若自訂 token 發生專案不匹配，靜默且安全地降級至匿名登入，避免干擾控制台執行
+                    try {
+                        await signInAnonymously(auth);
+                        console.log("Firebase Auth mismatch handled. Safely logged in anonymously.");
+                    } catch (anonError) {
+                        console.error("Critical: Anonymous sign-in also failed:", anonError);
+                    }
+                } else {
+                    console.error("Firebase Auth failed:", authError);
+                }
+            }
+        };
+        initAuth();
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                console.log("User successfully identified:", user.uid);
+                if (userId && selectedRound) {
+                    setupFirebaseProgressListeners();
+                }
+            }
+        });
+
+        render();
+
+    </script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+        }
+        /* Lucide icons 預設大小 */
+        [data-lucide] {
+            width: 1em;
+            height: 1em;
+        }
+        /* 確保懸浮視窗在最上層 */
+        #word-detail-popover {
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 font-sans text-gray-800 flex flex-col items-center justify-center p-4 min-h-screen">
+    <div id="app-root" class="w-full flex items-center justify-center">
+        <!-- 內容將由 JavaScript 動態填入 -->
+    </div>
+</body>
+</html>
